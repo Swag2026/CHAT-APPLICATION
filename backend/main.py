@@ -43,6 +43,7 @@ with engine.begin() as conn:
     conn.execute(text("ALTER TABLE messages ALTER COLUMN receiver_id DROP NOT NULL"))
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS group_id INTEGER"))
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE"))
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_type VARCHAR"))
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name VARCHAR"))
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_size INTEGER"))
     conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS push_token VARCHAR"))
