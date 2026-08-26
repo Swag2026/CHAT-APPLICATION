@@ -28,6 +28,7 @@ from pydantic import BaseModel
 from typing import Dict
 import json
 import httpx
+from datetime import datetime, timezone
 
 from database import engine, get_db, SessionLocal
 from models import Base, User, Group, GroupMember, Message
@@ -43,9 +44,13 @@ with engine.begin() as conn:
     conn.execute(text("ALTER TABLE messages ALTER COLUMN receiver_id DROP NOT NULL"))
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS group_id INTEGER"))
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE"))
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_url VARCHAR"))
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_type VARCHAR"))
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name VARCHAR"))
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_size INTEGER"))
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS call_status VARCHAR"))
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS call_type VARCHAR"))
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS call_duration INTEGER"))
     conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS push_token VARCHAR"))
 
 app = FastAPI(title="Chat App Backend")
@@ -148,10 +153,49 @@ def send_push_notification(push_token: str, title: str, body: str, data: dict = 
 def list_users(token: str, db: Session = Depends(get_db)):
     me = get_current_user(token, db)
     users = db.query(User).filter(User.id != me.id).all()
-    return [
-        {"id": u.id, "username": u.username, "online": u.id in active_connections}
-        for u in users
-    ]
+
+    result = []
+    for u in users:
+        last_msg = (
+            db.query(Message)
+            .filter(
+                or_(
+                    and_(Message.sender_id == me.id, Message.receiver_id == u.id),
+                    and_(Message.sender_id == u.id, Message.receiver_id == me.id),
+                )
+            )
+            .order_by(Message.created_at.desc())
+            .first()
+        )
+        unread_count = (
+            db.query(Message)
+            .filter(Message.sender_id == u.id, Message.receiver_id == me.id, Message.is_read == False)
+            .count()
+        )
+
+        preview = None
+        if last_msg:
+            if last_msg.call_status:
+                preview = f"📞 {'Voice call' if last_msg.call_type == 'voice' else 'Call'}"
+            elif last_msg.file_type == "image":
+                preview = "📷 Photo"
+            elif last_msg.file_type == "file":
+                preview = f"📄 {last_msg.file_name or 'File'}"
+            else:
+                preview = last_msg.content
+
+        result.append({
+            "id": u.id,
+            "username": u.username,
+            "online": u.id in active_connections,
+            "last_message": preview,
+            "last_message_at": last_msg.created_at.isoformat() if last_msg else None,
+            "unread_count": unread_count,
+        })
+
+    # Sabse recent activity wale sabse upar
+    result.sort(key=lambda x: x["last_message_at"] or "", reverse=True)
+    return result
 
 
 @app.get("/messages/{other_id}")
@@ -172,12 +216,16 @@ def get_messages(other_id: int, token: str, db: Session = Depends(get_db)):
         {
             "id": m.id,
             "sender_id": m.sender_id,
+            "receiver_id": m.receiver_id,
             "content": m.content,
             "file_url": m.file_url,
             "file_type": m.file_type,
             "file_name": m.file_name,
             "file_size": m.file_size,
             "is_read": m.is_read,
+            "call_status": m.call_status,
+            "call_type": m.call_type,
+            "call_duration": m.call_duration,
             "created_at": m.created_at.isoformat(),
         }
         for m in msgs
@@ -213,7 +261,28 @@ def list_groups(token: str, db: Session = Depends(get_db)):
     result = []
     for g in groups:
         member_count = db.query(GroupMember).filter(GroupMember.group_id == g.id).count()
-        result.append({"id": g.id, "name": g.name, "member_count": member_count})
+        last_msg = (
+            db.query(Message)
+            .filter(Message.group_id == g.id)
+            .order_by(Message.created_at.desc())
+            .first()
+        )
+        preview = None
+        if last_msg:
+            if last_msg.file_type == "image":
+                preview = "📷 Photo"
+            elif last_msg.file_type == "file":
+                preview = f"📄 {last_msg.file_name or 'File'}"
+            else:
+                preview = last_msg.content
+        result.append({
+            "id": g.id,
+            "name": g.name,
+            "member_count": member_count,
+            "last_message": preview,
+            "last_message_at": last_msg.created_at.isoformat() if last_msg else None,
+        })
+    result.sort(key=lambda x: x["last_message_at"] or "", reverse=True)
     return result
 
 
@@ -248,6 +317,56 @@ def get_group_messages(group_id: int, token: str, db: Session = Depends(get_db))
 
 active_connections: Dict[int, WebSocket] = {}
 
+# user_id -> other user id jiske saath wo abhi call me hai (ringing ya connected).
+# Isi se "busy" signal decide hota hai - agar koi already kisi call me hai to
+# naya incoming offer relay nahi hota, seedha caller ko "call_busy" bhej dete hain.
+in_call: Dict[int, int] = {}
+
+# Active call ka meta-data track karta hai taaki call khatam hone par sahi status
+# (missed / rejected / ended) ke saath DB me ek "call log" entry save ho sake -
+# bilkul WhatsApp jaisा "Missed Voice Call" / "Voice Call Rejected" wala message.
+# Key: frozenset({caller_id, receiver_id}) - dono id ka order-independent pair.
+active_calls: Dict[frozenset, dict] = {}
+
+
+async def log_call_event(db: Session, caller_id: int, receiver_id: int, status: str, duration: int = None):
+    """Call khatam hone par ek Message row bana ke dono taraf broadcast karta hai."""
+    msg = Message(
+        sender_id=caller_id,
+        receiver_id=receiver_id,
+        call_status=status,
+        call_type="voice",
+        call_duration=duration,
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+
+    payload = json.dumps({
+        "type": "call_log",
+        "id": msg.id,
+        "sender_id": caller_id,
+        "receiver_id": receiver_id,
+        "call_status": status,
+        "call_type": "voice",
+        "call_duration": duration,
+        "created_at": msg.created_at.isoformat(),
+    })
+    for uid in (caller_id, receiver_id):
+        if uid in active_connections:
+            try:
+                await active_connections[uid].send_text(payload)
+            except Exception:
+                pass
+
+
+def clear_call_state(uid: int):
+    """Dono taraf se busy-mark hata do (agar the), aur doosra user_id return karo."""
+    other_id = in_call.pop(uid, None)
+    if other_id is not None:
+        in_call.pop(other_id, None)
+    return other_id
+
 
 async def broadcast_presence(user_id: int, online: bool):
     """Sabko batao ki ye user online/offline hua."""
@@ -277,143 +396,220 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
     try:
         while True:
             raw = await websocket.receive_text()
-            payload = json.loads(raw)
-            msg_type = payload.get("type", "message")
 
-            # ---- Naya text message (1-on-1) ----
-            if msg_type == "message":
-                receiver_id = payload["receiver_id"]
-                content = payload.get("content")
-                file_url = payload.get("file_url")
-                file_type = payload.get("file_type")
-                file_name = payload.get("file_name")
-                file_size = payload.get("file_size")
+            # Har message ko alag se try/except me rakhte hain - taaki ek galat/corrupt
+            # message poori connection ko crash na kare aur baaki messages bhi na uden.
+            try:
+                payload = json.loads(raw)
+                msg_type = payload.get("type", "message")
 
-                msg = Message(
-                    sender_id=user_id,
-                    receiver_id=receiver_id,
-                    content=content,
-                    file_url=file_url,
-                    file_type=file_type,
-                    file_name=file_name,
-                    file_size=file_size,
-                )
-                db.add(msg)
-                db.commit()
-                db.refresh(msg)
+                # ---- Naya text message (1-on-1) ----
+                if msg_type == "message":
+                    receiver_id = payload["receiver_id"]
+                    content = payload.get("content")
+                    file_url = payload.get("file_url")
+                    file_type = payload.get("file_type")
+                    file_name = payload.get("file_name")
+                    file_size = payload.get("file_size")
 
-                response = {
-                    "type": "message",
-                    "id": msg.id,
-                    "sender_id": user_id,
-                    "receiver_id": receiver_id,
-                    "content": content,
-                    "file_url": file_url,
-                    "file_type": file_type,
-                    "file_name": file_name,
-                    "file_size": file_size,
-                    "is_read": False,
-                    "created_at": msg.created_at.isoformat(),
-                }
+                    msg = Message(
+                        sender_id=user_id,
+                        receiver_id=receiver_id,
+                        content=content,
+                        file_url=file_url,
+                        file_type=file_type,
+                        file_name=file_name,
+                        file_size=file_size,
+                    )
+                    db.add(msg)
+                    db.commit()
+                    db.refresh(msg)
 
-                if receiver_id in active_connections:
-                    await active_connections[receiver_id].send_text(json.dumps(response))
-                await websocket.send_text(json.dumps(response))
+                    response = {
+                        "type": "message",
+                        "id": msg.id,
+                        "sender_id": user_id,
+                        "receiver_id": receiver_id,
+                        "content": content,
+                        "file_url": file_url,
+                        "file_type": file_type,
+                        "file_name": file_name,
+                        "file_size": file_size,
+                        "is_read": False,
+                        "created_at": msg.created_at.isoformat(),
+                    }
 
-            # ---- Naya group message ----
-            elif msg_type == "group_message":
-                group_id = payload["group_id"]
-                content = payload.get("content")
-                file_url = payload.get("file_url")
-                file_type = payload.get("file_type")
-                file_name = payload.get("file_name")
-                file_size = payload.get("file_size")
+                    if receiver_id in active_connections:
+                        await active_connections[receiver_id].send_text(json.dumps(response))
+                    await websocket.send_text(json.dumps(response))
 
-                sender = db.query(User).filter(User.id == user_id).first()
+                # ---- Naya group message ----
+                elif msg_type == "group_message":
+                    group_id = payload["group_id"]
+                    content = payload.get("content")
+                    file_url = payload.get("file_url")
+                    file_type = payload.get("file_type")
+                    file_name = payload.get("file_name")
+                    file_size = payload.get("file_size")
 
-                msg = Message(
-                    sender_id=user_id,
-                    group_id=group_id,
-                    content=content,
-                    file_url=file_url,
-                    file_type=file_type,
-                    file_name=file_name,
-                    file_size=file_size,
-                )
-                db.add(msg)
-                db.commit()
-                db.refresh(msg)
+                    sender = db.query(User).filter(User.id == user_id).first()
 
-                response = {
-                    "type": "group_message",
-                    "id": msg.id,
-                    "group_id": group_id,
-                    "sender_id": user_id,
-                    "sender_username": sender.username if sender else None,
-                    "content": content,
-                    "file_url": file_url,
-                    "file_type": file_type,
-                    "file_name": file_name,
-                    "file_size": file_size,
-                    "created_at": msg.created_at.isoformat(),
-                }
+                    msg = Message(
+                        sender_id=user_id,
+                        group_id=group_id,
+                        content=content,
+                        file_url=file_url,
+                        file_type=file_type,
+                        file_name=file_name,
+                        file_size=file_size,
+                    )
+                    db.add(msg)
+                    db.commit()
+                    db.refresh(msg)
 
-                member_ids = [
-                    gm.user_id for gm in db.query(GroupMember).filter(GroupMember.group_id == group_id).all()
-                ]
-                for mid in member_ids:
-                    if mid in active_connections:
-                        await active_connections[mid].send_text(json.dumps(response))
+                    response = {
+                        "type": "group_message",
+                        "id": msg.id,
+                        "group_id": group_id,
+                        "sender_id": user_id,
+                        "sender_username": sender.username if sender else None,
+                        "content": content,
+                        "file_url": file_url,
+                        "file_type": file_type,
+                        "file_name": file_name,
+                        "file_size": file_size,
+                        "created_at": msg.created_at.isoformat(),
+                    }
 
-            # ---- Voice call signaling (seedha relay karte hain, DB me kuch save nahi karte) ----
-            elif msg_type in ("call_offer", "call_answer", "ice_candidate", "call_end", "call_reject"):
-                receiver_id = payload.get("receiver_id")
-                if receiver_id in active_connections:
-                    relay = dict(payload)
-                    relay["sender_id"] = user_id
-                    if msg_type == "call_offer":
+                    member_ids = [
+                        gm.user_id for gm in db.query(GroupMember).filter(GroupMember.group_id == group_id).all()
+                    ]
+                    for mid in member_ids:
+                        if mid in active_connections:
+                            await active_connections[mid].send_text(json.dumps(response))
+
+                # ---- Voice call signaling (seedha relay karte hain, DB me kuch save nahi karte) ----
+                elif msg_type == "call_offer":
+                    receiver_id = payload.get("receiver_id")
+
+                    # ---- Busy signal: agar caller ya receiver already kisi call me hain ----
+                    if user_id in in_call or receiver_id in in_call:
+                        await websocket.send_text(json.dumps({"type": "call_busy", "receiver_id": receiver_id}))
+
+                    elif receiver_id in active_connections:
+                        in_call[user_id] = receiver_id
+                        in_call[receiver_id] = user_id
+                        active_calls[frozenset({user_id, receiver_id})] = {
+                            "caller": user_id, "receiver": receiver_id, "answered": False, "answered_at": None,
+                        }
+                        relay = dict(payload)
+                        relay["sender_id"] = user_id
                         sender = db.query(User).filter(User.id == user_id).first()
                         relay["sender_username"] = sender.username if sender else "Unknown"
-                    await active_connections[receiver_id].send_text(json.dumps(relay))
-                elif msg_type == "call_offer":
-                    # Doosra online nahi hai (WebSocket connect nahi hai) - push notification try karo
-                    other_user = db.query(User).filter(User.id == receiver_id).first()
-                    sender = db.query(User).filter(User.id == user_id).first()
-                    if other_user and other_user.push_token:
-                        send_push_notification(
-                            other_user.push_token,
-                            title="Incoming call",
-                            body=f"{sender.username if sender else 'Someone'} is calling you",
-                            data={"type": "incoming_call", "caller_id": user_id, "caller_name": sender.username if sender else "Unknown"},
+                        await active_connections[receiver_id].send_text(json.dumps(relay))
+
+                    else:
+                        other_user = db.query(User).filter(User.id == receiver_id).first()
+                        sender = db.query(User).filter(User.id == user_id).first()
+                        if other_user and other_user.push_token:
+                            send_push_notification(
+                                other_user.push_token,
+                                title="Incoming call",
+                                body=f"{sender.username if sender else 'Someone'} is calling you",
+                                data={"type": "incoming_call", "caller_id": user_id, "caller_name": sender.username if sender else "Unknown"},
+                            )
+                        await websocket.send_text(json.dumps({"type": "call_unavailable", "receiver_id": receiver_id}))
+
+                elif msg_type in ("call_end", "call_reject"):
+                    receiver_id = payload.get("receiver_id")
+                    clear_call_state(user_id)  # dono taraf se busy-mark hatao
+
+                    key = frozenset({user_id, receiver_id})
+                    info = active_calls.pop(key, None)
+                    if info:
+                        caller, callee = info["caller"], info["receiver"]
+                        if msg_type == "call_reject":
+                            status = "rejected"
+                            duration = None
+                        elif info["answered"]:
+                            status = "ended"
+                            duration = int((datetime.now(timezone.utc) - info["answered_at"]).total_seconds())
+                        else:
+                            status = "missed"
+                            duration = None
+                        await log_call_event(db, caller, callee, status, duration)
+
+                    if receiver_id in active_connections:
+                        relay = dict(payload)
+                        relay["sender_id"] = user_id
+                        await active_connections[receiver_id].send_text(json.dumps(relay))
+
+                elif msg_type in ("call_answer", "ice_candidate"):
+                    receiver_id = payload.get("receiver_id")
+                    if msg_type == "call_answer":
+                        key = frozenset({user_id, receiver_id})
+                        if key in active_calls:
+                            active_calls[key]["answered"] = True
+                            active_calls[key]["answered_at"] = datetime.now(timezone.utc)
+                    if receiver_id in active_connections:
+                        relay = dict(payload)
+                        relay["sender_id"] = user_id
+                        await active_connections[receiver_id].send_text(json.dumps(relay))
+
+                # ---- "Typing..." indicator ----
+                elif msg_type == "typing":
+                    receiver_id = payload["receiver_id"]
+                    if receiver_id in active_connections:
+                        await active_connections[receiver_id].send_text(
+                            json.dumps({"type": "typing", "sender_id": user_id})
                         )
-                    await websocket.send_text(json.dumps({"type": "call_unavailable", "receiver_id": receiver_id}))
 
-            # ---- "Typing..." indicator ----
-            elif msg_type == "typing":
-                receiver_id = payload["receiver_id"]
-                if receiver_id in active_connections:
-                    await active_connections[receiver_id].send_text(
-                        json.dumps({"type": "typing", "sender_id": user_id})
-                    )
+                # ---- Read receipt ----
+                elif msg_type == "read":
+                    other_id = payload["other_id"]
+                    db.query(Message).filter(
+                        Message.sender_id == other_id,
+                        Message.receiver_id == user_id,
+                        Message.is_read == False,
+                    ).update({"is_read": True})
+                    db.commit()
 
-            # ---- Read receipt ----
-            elif msg_type == "read":
-                other_id = payload["other_id"]
-                db.query(Message).filter(
-                    Message.sender_id == other_id,
-                    Message.receiver_id == user_id,
-                    Message.is_read == False,
-                ).update({"is_read": True})
-                db.commit()
+                    if other_id in active_connections:
+                        await active_connections[other_id].send_text(
+                            json.dumps({"type": "read", "reader_id": user_id, "other_id": other_id})
+                        )
 
-                if other_id in active_connections:
-                    await active_connections[other_id].send_text(
-                        json.dumps({"type": "read", "reader_id": user_id, "other_id": other_id})
-                    )
+            except WebSocketDisconnect:
+                raise  # ye bahar wale except me handle hoga (normal disconnect)
+            except Exception as e:
+                # Koi bhi aur error (DB, bad payload, waghera) - session clean karo aur connection zinda rakho
+                db.rollback()
+                print(f"WS message handling error: {e}")
 
     except WebSocketDisconnect:
         active_connections.pop(user_id, None)
         await broadcast_presence(user_id, False)
+
+        # Agar user beech call me hi disconnect hua (app band/crash/net gaya),
+        # to doosre party ko bhi "call_end" bhejo aur uska busy-mark hatao -
+        # warna wo hamesha "busy" dikhta rahega jab tak khud dobara open na kare.
+        other_id = clear_call_state(user_id)
+        if other_id:
+            key = frozenset({user_id, other_id})
+            info = active_calls.pop(key, None)
+            if info:
+                caller, callee = info["caller"], info["receiver"]
+                if info["answered"]:
+                    status = "ended"
+                    duration = int((datetime.now(timezone.utc) - info["answered_at"]).total_seconds())
+                else:
+                    status = "missed"
+                    duration = None
+                await log_call_event(db, caller, callee, status, duration)
+            if other_id in active_connections:
+                await active_connections[other_id].send_text(
+                    json.dumps({"type": "call_end", "sender_id": user_id})
+                )
     finally:
         db.close()
 

@@ -49,6 +49,9 @@ class Message(Base):
     file_size = Column(Integer, nullable=True)
     is_delivered = Column(Boolean, default=False)
     is_read = Column(Boolean, default=False)
+    call_status = Column(String, nullable=True)   # "missed" | "rejected" | "ended" (voice call log entry)
+    call_type = Column(String, nullable=True)      # "voice" (video calling not implemented yet)
+    call_duration = Column(Integer, nullable=True)  # seconds, only for "ended" calls
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     sender = relationship("User", foreign_keys=[sender_id])
